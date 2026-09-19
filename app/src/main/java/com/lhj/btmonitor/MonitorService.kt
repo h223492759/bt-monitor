@@ -1,5 +1,6 @@
 package com.lhj.btmonitor
 
+import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -13,6 +14,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 
 /**
@@ -33,7 +35,12 @@ class MonitorService : Service() {
         const val ACTION_STOP = "com.lhj.btmonitor.action.STOP"
         const val ACTION_SAMPLE = "com.lhj.btmonitor.action.SAMPLE"
         const val ACTION_INTERVAL = "com.lhj.btmonitor.action.INTERVAL"
+        /** 看门狗专用：与 ACTION_SAMPLE 分开，避免"健康时也被强行采样"污染 60s 节奏 */
+        const val ACTION_WATCHDOG = "com.lhj.btmonitor.action.WATCHDOG"
         const val EXTRA_INTERVAL = "interval_sec"
+
+        /** 看门狗闹钟的 PendingIntent 请求码（与通知 id 复用值无所谓，语义不同） */
+        private const val WATCHDOG_REQ = 2001
 
         @Volatile var running = false
         @Volatile var startedAt = 0L
@@ -93,6 +100,7 @@ class MonitorService : Service() {
         override fun run() {
             doSample("tick")
             handler.postDelayed(this, intervalMs)
+            scheduleWatchdog()
         }
     }
 
@@ -104,6 +112,11 @@ class MonitorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 进程重启后 intervalMs 会退回类默认值 → 每次进来先按 intent/pref 对齐，
+        // 否则看门狗、START 日志、ticker 节奏都会用错间隔。
+        val ivExtra = intent?.getIntExtra(EXTRA_INTERVAL, -1) ?: -1
+        intervalMs = (if (ivExtra > 0) ivExtra else Snap.prefs(this).getInt("interval", 60))
+            .coerceIn(10, 3600) * 1000L
         when (intent?.action) {
             ACTION_STOP -> {
                 doSample("before_stop")
@@ -113,8 +126,30 @@ class MonitorService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_SAMPLE -> {
+                // ❗这里必须走 ensureRunning()。
+                // 旧版这个分支只 ensureForeground + doSample，**不排 ticker**，
+                // 于是「升级/进程被杀后由 App 的采样入口把服务拉起来」会得到一个
+                // 「通知在、进程在、却一条数据都不写」的空壳服务 —— 2026-09-19 实测踩到：
+                // 装完 v1.0.3 后日志凭空断了 39 分钟，而通知还写着"运行中"。
                 ensureForeground()
-                doSample("manual")
+                if (!ensureRunning()) doSample("manual")
+                kickTicker()
+                return START_STICKY
+            }
+            ACTION_WATCHDOG -> {
+                // 兜底巡检。**健康时一行日志都不写**（否则每 3 分钟多一行，破坏 60s 采样节奏）；
+                // 只有真死了（服务没在跑 / ticker 早就停了）才动手恢复并补一拍。
+                ensureForeground()
+                val last = Snap.prefs(this).getLong("last_tick", 0L)
+                val stale = System.currentTimeMillis() - last > intervalMs * 2L + 20_000L
+                val started = ensureRunning()
+                if (started || stale) {
+                    // ensureRunning() 成功时已经写过一条 startup 采样，不重复写
+                    if (!started) doSample("watchdog")
+                    kickTicker()
+                } else {
+                    scheduleWatchdog()
+                }
                 return START_STICKY
             }
             ACTION_INTERVAL -> {
@@ -122,8 +157,8 @@ class MonitorService : Service() {
                 intervalMs = v * 1000L
                 Snap.prefs(this).edit().putInt("interval", v).apply()
                 ensureForeground()
-                handler.removeCallbacks(ticker)
-                handler.postDelayed(ticker, intervalMs)
+                ensureRunning()
+                kickTicker()
                 LogStore.append(this, Snap.event("service", "interval=" + v + "s"))
                 updateNotification()
                 return START_STICKY
@@ -133,27 +168,85 @@ class MonitorService : Service() {
                 val v = if (iv > 0) iv else Snap.prefs(this).getInt("interval", 60)
                 intervalMs = v.coerceIn(10, 3600) * 1000L
                 ensureForeground()
-                if (!running) {
-                    running = true
-                    startedAt = System.currentTimeMillis()
-                    Snap.prefs(this).edit().putBoolean("user_stopped", false).apply()
-                    LogStore.append(
-                        this,
-                        Snap.event(
-                            "service",
-                            "START interval=" + (intervalMs / 1000) + "s android=" +
-                                Build.VERSION.RELEASE + "(API " + Build.VERSION.SDK_INT + ")"
-                        )
-                    )
-                    doSample("startup")
-                    registerNetCallback()
-                    Snap.prefs(this).edit().putBoolean("svc_running", true).apply()
-                }
-                handler.removeCallbacks(ticker)
-                handler.postDelayed(ticker, intervalMs)
+                ensureRunning()
+                kickTicker()
                 return START_STICKY
             }
         }
+    }
+
+    /**
+     * 进入「运行态」。幂等：已在运行则直接返回 false。
+     *
+     * ⚠️ 所有非 STOP 分支都必须调用它。曾经只有 `else`（ACTION_START / null intent）
+     * 分支做初始化，导致其它入口只能得到一个「半启动」的服务（见 ACTION_SAMPLE 注释）。
+     *
+     * @return true = 本次调用真正完成了启动初始化
+     */
+    private fun ensureRunning(): Boolean {
+        if (running) return false
+        running = true
+        startedAt = System.currentTimeMillis()
+        Snap.prefs(this).edit().putBoolean("user_stopped", false).apply()
+        LogStore.append(
+            this,
+            Snap.event(
+                "service",
+                "START interval=" + (intervalMs / 1000) + "s android=" +
+                    Build.VERSION.RELEASE + "(API " + Build.VERSION.SDK_INT + ") ver=" +
+                    BuildConfig.VERSION_NAME
+            )
+        )
+        doSample("startup")
+        registerNetCallback()
+        Snap.prefs(this).edit().putBoolean("svc_running", true).apply()
+        return true
+    }
+
+    /** 重置采样节奏：取消旧的 ticker 与看门狗，按当前 interval 重排。幂等，可随时调用 */
+    private fun kickTicker() {
+        handler.removeCallbacks(ticker)
+        handler.postDelayed(ticker, intervalMs)
+        scheduleWatchdog()
+    }
+
+    /**
+     * 看门狗：用 AlarmManager 给 ticker 兜底。
+     *
+     * Handler 的 ticker 会在两种情况下停：① 设备进 Doze（CPU 睡）② 进程被厂商省电策略杀掉。
+     * 这两者都**不产生任何异常日志**，只表现为「日志凭空断掉」—— 对"跑一周"的监控是致命的。
+     * 所以额外排一个 setAndAllowWhileIdle 闹钟：即使 ticker 已死，也会被唤醒一次
+     * （走 ACTION_SAMPLE → ensureRunning/kickTicker → 自动恢复）。
+     *
+     * 用 `getForegroundService` 而不是 `getService`：Android 12+ 从后台启动前台服务会被拒，
+     * 走 foreground 版本系统才会放行。setAndAllowWhileIdle 不需要 SCHEDULE_EXACT_ALARM 权限。
+     */
+    private fun scheduleWatchdog() {
+        try {
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            am.setAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + intervalMs * 3L,
+                watchdogIntent()
+            )
+        } catch (t: Throwable) {
+        }
+    }
+
+    private fun cancelWatchdog() {
+        try {
+            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            am.cancel(watchdogIntent())
+        } catch (t: Throwable) {
+        }
+    }
+
+    private fun watchdogIntent(): PendingIntent {
+        val i = Intent(this, MonitorService::class.java).setAction(ACTION_WATCHDOG)
+        return PendingIntent.getForegroundService(
+            this, WATCHDOG_REQ, i,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
     }
 
     private fun doSample(tag: String) {
@@ -297,6 +390,7 @@ class MonitorService : Service() {
         running = false
         Snap.prefs(this).edit().putBoolean("svc_running", false).apply()
         handler.removeCallbacks(ticker)
+        cancelWatchdog()
         unregisterNetCallback()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
@@ -309,6 +403,9 @@ class MonitorService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacks(ticker)
+        // ⚠️ 这里**故意不** cancelWatchdog()：进程被厂商杀掉时 onDestroy 可能都不走；
+        // 而真走到了（例如 stopped by system），留着闹钟反而能把它叫回来。
+        // 用户主动停止走 teardown()，那里会明确取消。
         unregisterNetCallback()
         running = false
         super.onDestroy()

@@ -45,17 +45,30 @@ class MainActivity : Activity() {
         setContentView(buildUi())
 
         requestNeededPermissions()
-
-        // 首次打开即自动开始（默认间隔 60s）
-        val p0 = Snap.prefs(this)
-        if (p0.getBoolean("autostart", true) && !p0.getBoolean("user_stopped", false) && !isServiceRunning()) {
-            MonitorService.start(this, Snap.prefs(this).getInt("interval", 60))
-        }
+        autoStartIfNeeded()
     }
 
     override fun onResume() {
         super.onResume()
+        // 回到前台也补一次：升级/被系统杀掉后，只要用户打开 App 就能自愈
+        // （荣耀实测不会投递 MY_PACKAGE_REPLACED，升级后服务不会自动回来）
+        autoStartIfNeeded()
         handler.post(refresher)
+    }
+
+    /**
+     * 需要时自动启动监控。
+     * 判定用 [isServiceRunning]（进程内真实状态），而不是持久化标记 —— 否则升级后永远起不来。
+     */
+    private fun autoStartIfNeeded() {
+        try {
+            val p = Snap.prefs(this)
+            if (!p.getBoolean("autostart", true)) return
+            if (p.getBoolean("user_stopped", false)) return
+            if (isServiceRunning()) return
+            MonitorService.start(this, p.getInt("interval", 60))
+        } catch (t: Throwable) {
+        }
     }
 
     override fun onPause() {
@@ -133,8 +146,14 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------- 状态刷新
 
-    private fun isServiceRunning(): Boolean =
-        Snap.prefs(this).getBoolean("svc_running", false)
+    /**
+     * 服务是否真的在运行。
+     *
+     * ❗必须用进程内的静态标记，**不能读 `svc_running` 这个持久化 pref** ——
+     * 进程被杀（升级、被厂商清理）后该 pref 仍是 true，界面就会误判成"运行中"并
+     * 跳过自动启动，于是永远停在「通知在、数据不写」的空壳状态（2026-09-19 实测）。
+     */
+    private fun isServiceRunning(): Boolean = MonitorService.running
 
     private fun fmt(sec: Long): String {
         if (sec < 0) return "-"
@@ -146,6 +165,13 @@ class MainActivity : Activity() {
             h > 0 -> h.toString() + "h" + m + "m"
             else -> m.toString() + "m"
         }
+    }
+
+    /** 「X 秒/分钟前」——秒级也要看得见，用于判断采样有没有停滞 */
+    private fun fmtAgo(sec: Long): String = when {
+        sec < 0 -> "无记录"
+        sec < 90 -> sec.toString() + " 秒前"
+        else -> fmt(sec) + " 前"
     }
 
     private fun fmtSize(b: Long): String = when {
@@ -176,10 +202,19 @@ class MainActivity : Activity() {
         val stats = LogStore.stats(this)
         val up = if (MonitorService.startedAt > 0L)
             (System.currentTimeMillis() - MonitorService.startedAt) / 1000L else -1L
+        // 「最后采样」是判断监控是否真的在出数据的唯一直观依据：
+        // 服务"在跑"但采样停滞时，通知和日志都不会报错，只能靠这个看出来（2026-09-19 踩过）。
+        val lastTick = Snap.prefs(this).getLong("last_tick", 0L)
+        val ivSec = Snap.prefs(this).getInt("interval", 60).coerceIn(10, 3600)
+        val sinceTick = if (lastTick > 0L) (System.currentTimeMillis() - lastTick) / 1000L else -1L
+        val stalled = running && (sinceTick < 0L || sinceTick > ivSec * 3L)
 
         statusView.text = buildString {
             append("服务      : ").append(if (running) "运行中" else "已停止")
             append("   本次运行 ").append(fmt(up)).append('\n')
+            append("最后采样  : ").append(fmtAgo(sinceTick))
+            if (stalled) append("   ⚠ 采样已停滞！请点「停止」再「开始」")
+            append('\n')
             append("蓝牙      : ").append(bt).append("   期望=")
             append(if (btSet == 1) "开" else "关").append('\n')
             append("本次ON持续: ").append(fmt(btUp)).append('\n')

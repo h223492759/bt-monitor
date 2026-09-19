@@ -33,10 +33,16 @@ class EventReceiver : BroadcastReceiver() {
         private fun tryHeal(ctx: Context) {
             try {
                 val p = Snap.prefs(ctx)
-                if (p.getBoolean("svc_running", false)) return
                 if (p.getBoolean("user_stopped", false)) return
                 if (!p.getBoolean("autostart", true)) return
-                MonitorService.start(ctx, p.getInt("interval", 60))
+                val iv = p.getInt("interval", 60).coerceIn(10, 3600)
+                // ❗判据必须是「现在是否真的在产数据」，**不能看 svc_running 这个持久化标记** ——
+                //   进程被杀后它仍然是 true，会让自愈永远不触发（实测：静默停摆 39 分钟没被救回来）。
+                //   改成看 last_tick 的新鲜度：超过 3 个采样周期没有任何数据 = 确实死了，才动手。
+                val last = p.getLong("last_tick", 0L)
+                val stale = System.currentTimeMillis() - last > iv * 3L * 1000L
+                if (MonitorService.running && !stale) return
+                MonitorService.start(ctx, iv)
             } catch (t: Throwable) {
             }
         }
