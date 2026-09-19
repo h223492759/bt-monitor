@@ -80,9 +80,20 @@ jobs:
             fi
           fi
           ls -l ~/.android/debug.keystore
+          echo "--- 密钥库里的证书指纹（这一步是排查签名不一致的关键证据）---"
+          keytool -list -v -keystore ~/.android/debug.keystore -storepass android 2>/dev/null \
+            | grep -iE "SHA256:|别名|Alias" || true
 
       - name: Build release APK
-        run: gradle assembleRelease --no-daemon --stacktrace
+        env:
+          BT_KEYSTORE_ALIAS: androiddebugkey
+          BT_KEYSTORE_STORE_PASS: android
+          BT_KEYSTORE_KEY_PASS: android
+        run: |
+          export BT_KEYSTORE="$HOME/.android/debug.keystore"
+          echo "BT_KEYSTORE=$BT_KEYSTORE"
+          ls -l "$BT_KEYSTORE"
+          gradle assembleRelease --no-daemon --stacktrace
 
       - name: Collect APK info
         run: |
