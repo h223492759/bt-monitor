@@ -10,6 +10,16 @@ adb 只能盯几十分钟，手机一拿走就断。所以做成 App，能跟着
 
 ---
 
+## 下载安装（最新版）
+
+👉 **https://github.com/h223492759/bt-monitor/releases/latest**
+
+在 Release 页面下载 `app-release.apk` 直接装到手机即可（自用，复用 debug 签名，无需额外证书）。
+
+> 首次安装需在手机上允许"安装未知来源应用"。装完**先做第四节那 4 步保活设置**，再放着跑一周。
+
+---
+
 ## 一、它记录什么
 
 | 类别 | 内容 |
@@ -83,11 +93,11 @@ adb 只能盯几十分钟，手机一拿走就断。所以做成 App，能跟着
 
 ### 方式 A：GitHub Actions（推荐，零本地环境）
 
-推 tag 即出 APK，并自动创建 Release：
+推 tag 即出 APK，并自动创建 Release（tag 约定 `vYYMMDD-HHMM`，如 `v260919-1557`）：
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v260919-1557
+git push origin v260919-1557
 ```
 
 也可以在 Actions 页面手动 `Run workflow`。
