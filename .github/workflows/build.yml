@@ -56,18 +56,30 @@ jobs:
         with:
           gradle-version: '8.13'
 
-      # AGP 会自己生成 ~/.android/debug.keystore；这里显式生成一次，彻底排除环境差异
-      - name: Ensure debug keystore
+      # ⚠️ 签名必须跨版本完全一致，否则手机无法覆盖安装升级
+      #    （INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match）。
+      #    旧写法每次都由 keytool 现场生成 -> 每版签名都不同 -> 只能卸载重装（会丢数据）。
+      #    仓库是 public，密钥库不能提交进代码，所以放在 Actions Secret 里（base64）。
+      - name: Restore fixed debug keystore
+        env:
+          KS_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
         run: |
           mkdir -p ~/.android
-          if [ ! -f ~/.android/debug.keystore ]; then
-            keytool -genkeypair -v \
-              -keystore ~/.android/debug.keystore \
-              -storepass android -keypass android \
-              -alias androiddebugkey \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
+          if [ -n "$KS_B64" ]; then
+            printf '%s' "$KS_B64" | base64 -d > ~/.android/debug.keystore
+            echo "已从 Secret 还原固定签名密钥库"
+          else
+            echo "::warning::未配置 DEBUG_KEYSTORE_B64，本次用临时密钥库；版本间签名会不一致，无法覆盖安装"
+            if [ ! -f ~/.android/debug.keystore ]; then
+              keytool -genkeypair -v \
+                -keystore ~/.android/debug.keystore \
+                -storepass android -keypass android \
+                -alias androiddebugkey \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
           fi
+          ls -l ~/.android/debug.keystore
 
       - name: Build release APK
         run: gradle assembleRelease --no-daemon --stacktrace
@@ -78,6 +90,11 @@ jobs:
           APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
           echo "APK_FILE=$(basename "$APK")" >> $GITHUB_ENV
           echo "APK_SHA256=$(sha256sum "$APK" | awk '{print $1}')" >> $GITHUB_ENV
+          echo "--- 签名证书（每版必须一致，否则无法覆盖安装）---"
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | head -n1)
+          "$APKSIGNER" verify --print-certs "$APK" | grep -iE 'Signer #1 certificate (DN|SHA-256)' || true
+          SIGNER=$("$APKSIGNER" verify --print-certs "$APK" | grep -i 'Signer #1 certificate SHA-256' | head -n1 | awk '{print $NF}')
+          echo "APK_SIGNER=$SIGNER" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -98,6 +115,10 @@ jobs:
 
             - APK：${{ env.APK_FILE }}
             - SHA256：${{ env.APK_SHA256 }}
+            - 签名证书 SHA-256：${{ env.APK_SIGNER }}
             - 构建来源：${{ github.sha }}
+
+            **签名已固定**：各版本证书相同，可直接覆盖安装升级，数据不丢。
+            （早期版本用的是每次构建临时生成的密钥库，签名不一致，需先卸载再装。）
 
             装好后请按 App 内「保活设置说明」完成 4 步设置，否则长时间监控可能被系统中断。

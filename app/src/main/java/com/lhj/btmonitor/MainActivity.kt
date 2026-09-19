@@ -168,6 +168,11 @@ class MainActivity : Activity() {
         val bat = Snap.battery(this)
         val scr = Snap.screenState(this)
         val crash = Snap.crashCount(this)
+        val fe = Snap.failEnableCount(this)
+        val tryN = Snap.tryCount(this)
+        val okN = Snap.onCount(this)
+        val stuckSince = Snap.prefs(this).getLong("stuck_since", 0L)
+        val stuckUp = if (stuckSince > 0L) (System.currentTimeMillis() - stuckSince) / 1000L else -1L
         val stats = LogStore.stats(this)
         val up = if (MonitorService.startedAt > 0L)
             (System.currentTimeMillis() - MonitorService.startedAt) / 1000L else -1L
@@ -178,7 +183,13 @@ class MainActivity : Activity() {
             append("蓝牙      : ").append(bt).append("   期望=")
             append(if (btSet == 1) "开" else "关").append('\n')
             append("本次ON持续: ").append(fmt(btUp)).append('\n')
-            append("疑似崩溃  : ").append(crash).append(" 次\n")
+            append("开启尝试  : ").append(tryN).append(" 次，成功 ")
+            append(okN).append(" 次\n")
+            append("非人为关闭: ").append(crash).append(" 次（其中启用阶段失败 ")
+            append(fe).append(" 次）\n")
+            if (stuckUp >= 0) {
+                append("⚠ 想开没开 : 已持续 ").append(fmt(stuckUp)).append('\n')
+            }
             append("飞行模式  : ").append(if (ap == 1) "开" else "关").append('\n')
             append("Wi-Fi     : ").append(wifi)
             append("   SSID=").append(sr[0])

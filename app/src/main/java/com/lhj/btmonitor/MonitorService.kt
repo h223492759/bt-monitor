@@ -161,6 +161,8 @@ class MonitorService : Service() {
             val line = Snap.buildHb(this, tag)
             LogStore.append(this, line)
             lastHbLine = line
+            // 「想开却没开」的遗留异常态没有状态跃迁可捕获，只能靠采样发现
+            for (l in Snap.checkStuckOff(this)) LogStore.append(this, l)
         } catch (t: Throwable) {
         }
         Snap.prefs(this).edit().putLong("last_tick", System.currentTimeMillis()).apply()
@@ -204,7 +206,11 @@ class MonitorService : Service() {
         val st = Snap.btName(Snap.adapterState(this))
         val up = if (startedAt > 0) (System.currentTimeMillis() - startedAt) / 1000L else 0L
         val crash = Snap.crashCount(this)
-        val text = "蓝牙=" + st + " · 疑似崩溃 " + crash + " 次 · 已运行 " + fmtDur(up)
+        val fe = Snap.failEnableCount(this)
+        val tryN = Snap.tryCount(this)
+        val okN = Snap.onCount(this)
+        val text = "蓝牙=" + st + " · 尝试" + tryN + "成功" + okN +
+            " · 崩溃" + crash + "(启用" + fe + ") · " + fmtDur(up)
         return NotificationCompat.Builder(this, CH_ID)
             .setSmallIcon(R.drawable.ic_launcher)
             .setContentTitle("蓝牙监控运行中")

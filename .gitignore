@@ -19,4 +19,5 @@ out/
 release/
 *.jks
 *.keystore
-!debug.keystore
+# 密钥库一律不入库：签名固定靠 Actions Secret(DEBUG_KEYSTORE_B64) 下发
+keystore.properties

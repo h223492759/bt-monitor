@@ -16,6 +16,11 @@ adb 只能盯几十分钟，手机一拿走就断。所以做成 App，能跟着
 
 在 Release 页面下载 `app-release.apk` 直接装到手机即可（自用，复用 debug 签名，无需额外证书）。
 
+> **签名已固定**：构建用的密钥库放在仓库 Actions Secret 里，各版本签名证书完全一致，
+> 所以**新版本可以直接覆盖安装升级，监控数据不会丢**。
+> （最早那版每次构建都临时生成密钥库，签名不一致，装新包会报
+> `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，那版必须先卸载。）
+
 > 首次安装需在手机上允许"安装未知来源应用"。装完**先做第四节那 4 步保活设置**，再放着跑一周。
 
 ---
@@ -24,7 +29,7 @@ adb 只能盯几十分钟，手机一拿走就断。所以做成 App，能跟着
 
 | 类别 | 内容 |
 |---|---|
-| 蓝牙 | 适配器状态变化（OFF / TURNING_ON / ON / TURNING_OFF）、**本次 ON 已持续秒数**、**疑似崩溃次数**、本机蓝牙名 |
+| 蓝牙 | 适配器状态变化（OFF / TURNING_ON / ON / TURNING_OFF）、**本次 ON 已持续秒数**、**开启尝试次数 / 成功次数**、**非人为关闭次数（区分"运行中掉线"与"启用阶段就失败"）**、**"想开却没开"持续时长**、本机蓝牙名 |
 | 飞行模式 | 开 / 关 |
 | Wi-Fi | Wi-Fi 开关状态、期望状态、SSID、RSSI |
 | 移动网络 | 当前承载（WIFI / CELLULAR / NONE）、蜂窝是否可用、移动数据期望开关 |
@@ -55,9 +60,13 @@ adb 只能盯几十分钟，手机一拿走就断。所以做成 App，能跟着
 
 ```
 15:20:11.123 HB|src=tick|bt=ON|btSet=1|btUp=1699|btName=My Phone|ap=0|wifi=ENABLED|wifiSet=1|ssid=MyWiFi|rssi=-45|cell=1|net=WIFI|mdata=1|scr=OFF|batt=85|chg=Y|up=12345|crash=3
-15:21:02.456 EV|bt_adapter|TURNING_ON->ON|btSet=1
-15:21:02.460 EV|bt_ready|reached_ON|btName=My Phone
-15:29:31.900 EV|SUSPECT_CRASH|ON->OFF 但系统期望仍为开(btSet=1)|crash=4
+15:21:02.440 EV|bt_try|第4次尝试开启|prev=OFF
+15:21:02.456 EV|bt_adapter|OFF->TURNING_ON|btSet=1
+15:21:02.460 EV|bt_adapter|TURNING_ON->ON|btSet=1
+15:21:02.461 EV|bt_ready|reached_ON|btName=My Phone|尝试=4 成功=1 崩溃=3(启用阶段=3)
+15:29:31.900 EV|SUSPECT_CRASH|mode=ON_ENABLE TURNING_ON->OFF 系统期望仍为开(btSet=1) 非人为关闭|尝试=5 成功=1 崩溃=4(启用阶段=4)
+15:29:31.905 EV|STUCK_OFF|当前处于「系统期望开、实际却没开」的异常态 bt=OFF btSet=1|尝试=5 成功=1 崩溃=4(启用阶段=4)
+15:40:02.100 EV|STUCK_OFF_END|已脱离「想开没开」状态 持续=630s
 ```
 
 ### 字段表
@@ -76,16 +85,48 @@ adb 只能盯几十分钟，手机一拿走就断。所以做成 App，能跟着
 | `scr` | 屏幕 ON / OFF |
 | `batt` / `chg` | 电量百分比 / 是否在充电 |
 | `up` | **监控服务自身已运行秒数** —— 若出现大跳跃，说明监控曾被杀/被冻结，那段数据不可信 |
-| `crash` | 疑似崩溃累计次数 |
+| `crash` | 非人为关闭累计次数 |
 
-### 「疑似崩溃」是怎么判定的
+### 关键事件（分析时主要看这几类）
+
+| 事件 | 含义 |
+|---|---|
+| `EV\|bt_try` | 一次开启尝试（进入 `TURNING_ON`）。统计 `尝试=N` |
+| `EV\|bt_ready` | **成功到达 ON**，并带上累计统计 `尝试=N 成功=M 崩溃=X(启用阶段=Y)` |
+| `EV\|SUSPECT_CRASH` | **非人为关闭**。`mode=WHILE_ON`（开成功后运行中掉线）/ `mode=ON_ENABLE`（启用阶段就失败） |
+| `EV\|SUSPECT_CRASH_MORE` | 同类崩溃仍在持续，`burst=` 为 60 秒内的重复次数（防刷屏） |
+| `EV\|STUCK_OFF` | 采样时发现「系统期望开、实际却没开」——**这正是“根本打不开”的形态** |
+| `EV\|STUCK_OFF_END` | 脱离上述状态，`持续=Ns` 即卡了多久 |
+| `EV\|bt_off_by_user` | 人为关闭（`btSet` 变 0），与崩溃区分用 |
+
+### 「非人为关闭」是怎么判定的
 
 ```
-蓝牙从 ON 掉到 OFF/TURNING_OFF   且   btSet(系统期望) 仍然 = 1
+蓝牙掉到 OFF/TURNING_OFF   且   btSet(系统期望) 仍然 = 1
 ```
 
 两条同时成立 ⇒ 不是人关的（人关会把 `btSet` 置 0），而是**协议栈自己崩了**。
-这一条正是整件事的核心判据。
+
+> ⚠️ 注意这里**不要求“上一态必须是 ON”**。这一点很关键：本机最主要的故障形态是
+> **根本开不起来**（`OFF → TURNING_ON → OFF`，初始化阶段就崩，从不经过 ON）。
+> 如果只认 `ON→OFF`，这类崩溃会 100% 漏记 —— 而那恰恰是最该被记录的情况。
+> 所以判定分成 `mode=ON_ENABLE` 与 `mode=WHILE_ON` 两种，前者计「启用阶段失败」。
+
+另一种没有任何状态跃迁可捕获的情况是：**进 App 之前蓝牙就已经卡在“想开没开”**。
+这由周期采样兜底，记为 `STUCK_OFF`。
+
+### 与系统侧计数交叉验证（推荐）
+
+App 只能看到 Android 框架暴露的状态。系统自己还有一份**权威计数**，在电脑上跑：
+
+```bash
+adb shell dumpsys bluetooth_manager | grep -A30 "Enable log"
+adb shell dumpsys bluetooth_manager | grep "crashed"
+```
+
+其中 `Disable ... CRASH BluetoothSystemServer` 行就是每次崩溃的原始记录，
+`Bluetooth crashed N times` 是系统累计总数。拿它和 App 的 `crash=` 对照，
+两者应当量级吻合。
 
 ---
 
@@ -180,4 +221,7 @@ bt-monitor/
 - **系统能杀服务**：厂商省电策略可能在长时间灭屏后冻结或杀掉本 App。日志里的 `up` 字段就是用来发现这件事的。
 - **`ssid` 需要定位权限**，不给也能跑，只是 Wi-Fi 名记不到。
 - **`mdata`（移动数据期望值）** 在部分 ROM 上读不到，会是 -1，不影响 `cell`（蜂窝是否可用）的判断。
+- **`crash` 是"框架可见的"非人为关闭次数**，不等于系统内部计数。系统还会记录一些 App 层看不到的
+  协议栈重启（例如荣耀关闭蓝牙后底层停在 `BLE_ON`）。做严谨结论时请按第二节那条 adb 命令
+  取系统侧 `Bluetooth crashed N times` 交叉验证。
 - **无法区分“固件崩溃”与“驱动/固件层其他异常”** —— App 只能看到 Android 框架暴露的状态。要再往下结论，仍需 adb / tombstone。
