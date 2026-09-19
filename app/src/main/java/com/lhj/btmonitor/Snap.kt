@@ -75,7 +75,9 @@ object Snap {
 
     fun wifiSet(ctx: Context): Int = settingInt(ctx, Settings.Global.WIFI_ON)
 
-    fun mobileDataSet(ctx: Context): Int = settingInt(ctx, Settings.Global.MOBILE_DATA)
+    // 注意：Settings.Global.MOBILE_DATA 是 @hide 常量，公开 SDK 里不存在（编不过），
+    // 所以这里直接用它的实际键名字符串。
+    fun mobileDataSet(ctx: Context): Int = settingInt(ctx, "mobile_data")
 
     /** 返回 [net, cell] —— net 为当前承载，cell 为蜂窝是否可用 */
     fun netInfo(ctx: Context): Array<String> {
