@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.BtMonitor" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:colorPrimary">#FFC107</item>
+        <item name="android:colorPrimaryDark">#B28704</item>
+        <item name="android:colorAccent">#FFC107</item>
+        <item name="android:statusBarColor">#F5F5F5</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

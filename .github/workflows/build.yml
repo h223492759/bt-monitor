@@ -1,0 +1,89 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept SDK licenses
+        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: Install SDK packages
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools"
+
+      # 本工程不提交 gradle wrapper，由该 action 提供 Gradle 8.13 并自动做依赖缓存
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+
+      # AGP 会自己生成 ~/.android/debug.keystore；这里显式生成一次，彻底排除环境差异
+      - name: Ensure debug keystore
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore ~/.android/debug.keystore \
+              -storepass android -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build release APK
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK info
+        run: |
+          ls -lh app/build/outputs/apk/release/
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          echo "APK_FILE=$(basename "$APK")" >> $GITHUB_ENV
+          echo "APK_SHA256=$(sha256sum "$APK" | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bt-monitor-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Publish release (tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
+          generate_release_notes: true
+          name: bt-monitor ${{ github.ref_name }}
+          body: |
+            蓝牙 / 飞行模式 / Wi-Fi / 移动网络 状态监控 APK。
+
+            - APK：${{ env.APK_FILE }}
+            - SHA256：${{ env.APK_SHA256 }}
+            - 构建来源：${{ github.sha }}
+
+            装好后请按 App 内「保活设置说明」完成 4 步设置，否则长时间监控可能被系统中断。

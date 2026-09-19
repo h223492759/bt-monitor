@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">蓝牙监控</string>
+    <string name="notif_channel_name">状态监控运行中</string>
+    <string name="notif_channel_desc">保持蓝牙 / 飞行模式 / Wi-Fi / 移动网络状态记录</string>
+    <string name="notif_title">蓝牙监控运行中</string>
+</resources>
