@@ -33,6 +33,11 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private val INTERVALS = intArrayOf(15, 30, 60, 120, 300)
 
+    // 日志统计（字节数/行数）要把所有按天文件整个读一遍。界面每 2 秒刷新一次，
+    // 跑满一周后日志到 MB 级，每次都全量读会拖慢 UI → 每 5 次刷新（约 10 秒）才算一次。
+    private var refreshTick = 0
+    private var cachedStats = longArrayOf(-1L, -1L)
+
     private val refresher = object : Runnable {
         override fun run() {
             refresh()
@@ -199,7 +204,8 @@ class MainActivity : Activity() {
         val okN = Snap.onCount(this)
         val stuckSince = Snap.prefs(this).getLong("stuck_since", 0L)
         val stuckUp = if (stuckSince > 0L) (System.currentTimeMillis() - stuckSince) / 1000L else -1L
-        val stats = LogStore.stats(this)
+        if (refreshTick++ % 5 == 0 || cachedStats[0] < 0L) cachedStats = LogStore.stats(this)
+        val stats = cachedStats
         val up = if (MonitorService.startedAt > 0L)
             (System.currentTimeMillis() - MonitorService.startedAt) / 1000L else -1L
         // 「最后采样」是判断监控是否真的在出数据的唯一直观依据：
@@ -220,8 +226,11 @@ class MainActivity : Activity() {
             append("本次ON持续: ").append(fmt(btUp)).append('\n')
             append("开启尝试  : ").append(tryN).append(" 次，成功 ")
             append(okN).append(" 次\n")
-            append("非人为关闭: ").append(crash).append(" 次（其中启用阶段失败 ")
-            append(fe).append(" 次）\n")
+            // 措辞直白一点：这里的"崩溃"指**手机系统把蓝牙适配器自己重启了一遍**，
+            // 不是本 App 崩溃，也不是蓝牙被关掉不回来。典型形态 1~3 秒自恢复，用户通常察觉不到。
+            append("蓝牙自重启: ").append(crash).append(" 次（系统把蓝牙关掉又开回来，1~3 秒自恢复")
+            if (fe > 0) append("；其中启用阶段失败 ").append(fe).append(" 次")
+            append("）\n")
             if (stuckUp >= 0) {
                 append("⚠ 想开没开 : 已持续 ").append(fmt(stuckUp)).append('\n')
             }

@@ -5,11 +5,14 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -95,6 +98,9 @@ class MonitorService : Service() {
     private var foregrounded = false
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var cmRef: ConnectivityManager? = null
+
+    /** 服务内动态注册的系统状态广播接收器（飞行模式/屏幕/电源/Wi-Fi） */
+    private var sysReceiver: BroadcastReceiver? = null
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -188,6 +194,8 @@ class MonitorService : Service() {
         running = true
         startedAt = System.currentTimeMillis()
         Snap.prefs(this).edit().putBoolean("user_stopped", false).apply()
+        // 旧版把一次适配器重启记了两遍 → 历史计数虚高一倍，这里做一次性的整除回正
+        Snap.migrateCounts(this)
         LogStore.append(
             this,
             Snap.event(
@@ -199,6 +207,7 @@ class MonitorService : Service() {
         )
         doSample("startup")
         registerNetCallback()
+        registerSysEvents()
         Snap.prefs(this).edit().putBoolean("svc_running", true).apply()
         return true
     }
@@ -251,6 +260,8 @@ class MonitorService : Service() {
 
     private fun doSample(tag: String) {
         try {
+            // 先做重启自证：关机广播拿不到，只能用「墙钟流逝 - 系统运行时长流逝」把重启算出来
+            for (l in Snap.detectReboot(this)) LogStore.append(this, l)
             val line = Snap.buildHb(this, tag)
             LogStore.append(this, line)
             lastHbLine = line
@@ -303,7 +314,7 @@ class MonitorService : Service() {
         val tryN = Snap.tryCount(this)
         val okN = Snap.onCount(this)
         val text = "蓝牙=" + st + " · 尝试" + tryN + "成功" + okN +
-            " · 崩溃" + crash + "(启用" + fe + ") · " + fmtDur(up)
+            " · 自重启" + crash + "(启用" + fe + ") · " + fmtDur(up)
         return NotificationCompat.Builder(this, CH_ID)
             .setSmallIcon(R.drawable.ic_launcher)
             .setContentTitle("蓝牙监控运行中")
@@ -362,7 +373,18 @@ class MonitorService : Service() {
                         caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
                         else -> "OTHER"
                     }
-                    LogStore.append(this@MonitorService, Snap.event("net", "caps=" + t))
+                    // ❗去重：同一次网络状态下系统会反复回调（实测两天刷了 3884 行，占全部日志 97%）。
+                    // 改为**只在承载真的变化时写一行**，并带上「上一个承载持续了多久」，
+                    // 频率信息不丢、噪声基本清零。
+                    val p = Snap.prefs(this@MonitorService)
+                    val prev = p.getString("last_caps", "") ?: ""
+                    if (prev == t) return
+                    val nowMs = System.currentTimeMillis()
+                    val heldMs = nowMs - p.getLong("last_caps_wall", 0L)
+                    p.edit().putString("last_caps", t).putLong("last_caps_wall", nowMs).apply()
+                    val detail = if (prev.isEmpty()) "caps=" + t
+                    else "caps=" + prev + "->" + t + "|held=" + (heldMs / 1000L) + "s"
+                    LogStore.append(this@MonitorService, Snap.event("net", detail))
                 }
             }
             netCallback = cb
@@ -382,6 +404,95 @@ class MonitorService : Service() {
         cmRef = null
     }
 
+    /**
+     * 在服务里**动态注册**状态广播 —— 这是本工程最容易被忽略的一条通道。
+     *
+     * 为什么必须动态注册：这些 action 在 Manifest 里静态注册是**收不到**的。
+     * 实测（2026-09-19~20 两天日志）：静态注册了 11 个 action，只有「蓝牙 STATE_CHANGED」86 条
+     * 和「BOOT_COMPLETED」2 条真正到达；`ACTION_AIRPLANE_MODE_CHANGED` / `ACTION_SHUTDOWN` /
+     * `ACTION_POWER_*` / `ACTION_SCREEN_*` / `ACTION_USER_PRESENT` **全部 0 条**。
+     * 结果飞行模式只能靠"断网顺带采样"蹭到、关机完全无记录 —— 接收器里写的分支是死代码。
+     * （`ACTION_SCREEN_ON/OFF` 从 Android 8 起更是明确只允许动态注册。）
+     *
+     * 动态注册的接收器活在服务进程里，只要服务在跑就一定能收到。
+     */
+    private fun registerSysEvents() {
+        if (sysReceiver != null) return
+        try {
+            val r = object : BroadcastReceiver() {
+                override fun onReceive(c: Context?, i: Intent?) {
+                    if (i == null) return
+                    try {
+                        when (i.action) {
+                            Intent.ACTION_AIRPLANE_MODE_CHANGED -> {
+                                val on = if (i.hasExtra("state")) i.getBooleanExtra("state", false)
+                                else Snap.airplane(this@MonitorService) == 1
+                                LogStore.append(
+                                    this@MonitorService,
+                                    Snap.event(
+                                        "airplane",
+                                        "state=" + (if (on) 1 else 0) + "|bt=" +
+                                            Snap.btName(Snap.adapterState(this@MonitorService))
+                                    )
+                                )
+                            }
+                            Intent.ACTION_SCREEN_ON -> LogStore.append(
+                                this@MonitorService, Snap.event("screen", "ON")
+                            )
+                            Intent.ACTION_SCREEN_OFF -> LogStore.append(
+                                this@MonitorService, Snap.event("screen", "OFF")
+                            )
+                            Intent.ACTION_USER_PRESENT -> LogStore.append(
+                                this@MonitorService, Snap.event("screen", "UNLOCK")
+                            )
+                            Intent.ACTION_POWER_CONNECTED -> LogStore.append(
+                                this@MonitorService, Snap.event("power", "PLUGGED")
+                            )
+                            Intent.ACTION_POWER_DISCONNECTED -> LogStore.append(
+                                this@MonitorService, Snap.event("power", "UNPLUGGED")
+                            )
+                            WifiManager.WIFI_STATE_CHANGED_ACTION -> {
+                                val cur = i.getIntExtra(WifiManager.EXTRA_WIFI_STATE, -1)
+                                val prev = i.getIntExtra(WifiManager.EXTRA_PREVIOUS_WIFI_STATE, -1)
+                                LogStore.append(
+                                    this@MonitorService,
+                                    Snap.event("wifi", Snap.wifiName(prev) + "->" + Snap.wifiName(cur))
+                                )
+                            }
+                        }
+                    } catch (t: Throwable) {
+                    }
+                }
+            }
+            val f = IntentFilter().apply {
+                addAction(Intent.ACTION_AIRPLANE_MODE_CHANGED)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_USER_PRESENT)
+                addAction(Intent.ACTION_POWER_CONNECTED)
+                addAction(Intent.ACTION_POWER_DISCONNECTED)
+                addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
+            }
+            // Android 13+ 动态注册要求显式声明是否对外导出；这些全是系统广播，用 NOT_EXPORTED。
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(r, f, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(r, f)
+            }
+            sysReceiver = r
+        } catch (t: Throwable) {
+        }
+    }
+
+    private fun unregisterSysEvents() {
+        try {
+            val r = sysReceiver
+            if (r != null) unregisterReceiver(r)
+        } catch (t: Throwable) {
+        }
+        sysReceiver = null
+    }
+
     private fun teardown() {
         try {
             LogStore.append(this, Snap.event("service", "STOP by user"))
@@ -392,6 +503,7 @@ class MonitorService : Service() {
         handler.removeCallbacks(ticker)
         cancelWatchdog()
         unregisterNetCallback()
+        unregisterSysEvents()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
             else @Suppress("DEPRECATION") stopForeground(true)
@@ -407,6 +519,7 @@ class MonitorService : Service() {
         // 而真走到了（例如 stopped by system），留着闹钟反而能把它叫回来。
         // 用户主动停止走 teardown()，那里会明确取消。
         unregisterNetCallback()
+        unregisterSysEvents()
         running = false
         super.onDestroy()
     }

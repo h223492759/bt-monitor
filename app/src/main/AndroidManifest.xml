@@ -51,24 +51,20 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
-        <!-- 静态广播：进程被杀 / 重启后仍能收到关键事件 -->
+        <!-- 静态广播：只留**实测真正能到达**的蓝牙状态变化。
+             ⚠️ 不要在这里继续堆 action。2026-09-19~20 两天实测（荣耀 / Android 17）：
+             本文件曾静态注册 11 个 action，最终只有「蓝牙 STATE_CHANGED」86 条 与
+             「BOOT_COMPLETED」2 条到达，其余（AIRPLANE_MODE / SHUTDOWN / POWER_* /
+             SCREEN_* / USER_PRESENT / WIFI_* / CONNECTIVITY_CHANGE）**全部 0 条**，
+             等于接收器里那些分支从未执行过。
+             这些状态广播已改为在 MonitorService 内**动态注册**（见 registerSysEvents），
+             那是它们唯一可靠的通道（SCREEN_ON/OFF 自 Android 8 起更是只允许动态注册）。 -->
         <receiver
             android:name=".EventReceiver"
             android:enabled="true"
             android:exported="false">
             <intent-filter>
                 <action android:name="android.bluetooth.adapter.action.STATE_CHANGED" />
-                <action android:name="android.intent.action.AIRPLANE_MODE" />
-                <action android:name="android.net.wifi.WIFI_STATE_CHANGED" />
-                <action android:name="android.net.wifi.STATE_CHANGE" />
-                <action android:name="android.net.wifi.supplicant.CONNECTION_CHANGE" />
-                <action android:name="android.intent.action.SCREEN_ON" />
-                <action android:name="android.intent.action.SCREEN_OFF" />
-                <action android:name="android.intent.action.ACTION_POWER_CONNECTED" />
-                <action android:name="android.intent.action.ACTION_POWER_DISCONNECTED" />
-                <action android:name="android.net.conn.CONNECTIVITY_CHANGE" />
-                <action android:name="android.intent.action.USER_PRESENT" />
-                <action android:name="android.intent.action.ACTION_SHUTDOWN" />
             </intent-filter>
         </receiver>
 

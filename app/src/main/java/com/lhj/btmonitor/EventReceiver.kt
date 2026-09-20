@@ -4,20 +4,27 @@ import android.bluetooth.BluetoothAdapter
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.net.wifi.WifiManager
 
 /**
- * 状态变化捕获（静态注册，进程不在也能记）。
- * 这里出现的 action 都属于 Android 隐式广播豁免清单，静态注册长期有效；
- * 唯一例外是 CONNECTIVITY_CHANGE（7.0 起静态收不到），已由服务内的
- * registerDefaultNetworkCallback + 周期采样覆盖。
+ * 静态注册的状态变化捕获 —— 进程不在也能记。
+ *
+ * ⚠️ 这里**只处理蓝牙状态变化**，因为它是实测唯一真正能到达的静态广播
+ * （2026-09-19~20 两天 86 条）。历史上这里还写过飞行模式 / 屏幕 / 电源 / 关机 /
+ * Wi-Fi 的分支，跑两天后逐条清点发现**一条都没到达**：荣耀 Android 17 把这些
+ * 隐式状态广播基本全拦了（SCREEN_ON/OFF 自 Android 8 起更是只允许动态注册）。
+ * 那些通道已迁移到 `MonitorService.registerSysEvents()` 里动态注册，
+ * 对应的 manifest action 也已移除，避免两个通道同时写入造成重复行。
  */
 class EventReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         try {
             val ctx = context.applicationContext
-            handle(ctx, intent)
+            if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                val cur = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)
+                val prev = intent.getIntExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, -1)
+                for (l in Snap.onBluetoothChanged(ctx, prev, cur)) LogStore.append(ctx, l)
+            }
             tryHeal(ctx)
         } catch (t: Throwable) {
             // 记录失败不影响系统
@@ -44,58 +51,6 @@ class EventReceiver : BroadcastReceiver() {
                 if (MonitorService.running && !stale) return
                 MonitorService.start(ctx, iv)
             } catch (t: Throwable) {
-            }
-        }
-
-        fun handle(ctx: Context, intent: Intent) {
-            val a = intent.action ?: return
-            when (a) {
-
-                BluetoothAdapter.ACTION_STATE_CHANGED -> {
-                    val cur = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)
-                    val prev = intent.getIntExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, -1)
-                    for (l in Snap.onBluetoothChanged(ctx, prev, cur)) LogStore.append(ctx, l)
-                }
-
-                Intent.ACTION_AIRPLANE_MODE_CHANGED -> {
-                    val on = if (intent.hasExtra("state"))
-                        (if (intent.getBooleanExtra("state", false)) 1 else 0)
-                    else Snap.airplane(ctx)
-                    LogStore.append(
-                        ctx,
-                        Snap.event("airplane", "state=" + on + "|bt=" + Snap.btName(Snap.adapterState(ctx)))
-                    )
-                }
-
-                WifiManager.WIFI_STATE_CHANGED_ACTION -> {
-                    val cur = intent.getIntExtra(WifiManager.EXTRA_WIFI_STATE, -1)
-                    val prev = intent.getIntExtra(WifiManager.EXTRA_PREVIOUS_WIFI_STATE, -1)
-                    LogStore.append(ctx, Snap.event("wifi", Snap.wifiName(prev) + "->" + Snap.wifiName(cur)))
-                }
-
-                WifiManager.NETWORK_STATE_CHANGED_ACTION -> {
-                    val sr = Snap.ssidRssi(ctx)
-                    LogStore.append(ctx, Snap.event("wifi_net", "ssid=" + sr[0] + "|rssi=" + sr[1]))
-                }
-
-                WifiManager.SUPPLICANT_CONNECTION_CHANGE_ACTION -> {
-                    val c = intent.getBooleanExtra(WifiManager.EXTRA_SUPPLICANT_CONNECTED, false)
-                    LogStore.append(ctx, Snap.event("wifi_supp", "connected=" + (if (c) 1 else 0)))
-                }
-
-                Intent.ACTION_SCREEN_ON -> LogStore.append(ctx, Snap.event("screen", "ON"))
-                Intent.ACTION_SCREEN_OFF -> LogStore.append(ctx, Snap.event("screen", "OFF"))
-                Intent.ACTION_USER_PRESENT -> LogStore.append(ctx, Snap.event("screen", "UNLOCK"))
-
-                Intent.ACTION_POWER_CONNECTED -> LogStore.append(ctx, Snap.event("power", "PLUGGED"))
-                Intent.ACTION_POWER_DISCONNECTED -> LogStore.append(ctx, Snap.event("power", "UNPLUGGED"))
-
-                Intent.ACTION_SHUTDOWN -> LogStore.append(ctx, Snap.event("system", "SHUTDOWN"))
-
-                "android.net.conn.CONNECTIVITY_CHANGE" -> {
-                    val n = Snap.netInfo(ctx)
-                    LogStore.append(ctx, Snap.event("conn", "net=" + n[0] + "|cell=" + n[1]))
-                }
             }
         }
     }
