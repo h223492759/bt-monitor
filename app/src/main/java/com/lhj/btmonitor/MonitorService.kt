@@ -205,6 +205,9 @@ class MonitorService : Service() {
                     BuildConfig.VERSION_NAME
             )
         )
+        // 一次性历史回正：减掉旧版漏撤的那笔关机误报（须在 detectReboot 之前跑，
+        // 它会把 last_crash_wall 清零，避免随后再撤一次）
+        Snap.repairShutdownArtifactFromLog(this)
         doSample("startup")
         registerNetCallback()
         registerSysEvents()
@@ -415,6 +418,10 @@ class MonitorService : Service() {
      * （`ACTION_SCREEN_ON/OFF` 从 Android 8 起更是明确只允许动态注册。）
      *
      * 动态注册的接收器活在服务进程里，只要服务在跑就一定能收到。
+     *
+     * 注：`ACTION_SHUTDOWN` / `ACTION_REBOOT` 也在这里动态注册 —— 它们是**关机误报的第一现场**
+     * （系统关机时会关掉蓝牙适配器，而 `bluetooth_on` 设置值仍是 1），拿到广播就能当场撤销那笔误报，
+     * 不必等下次开机靠 `elapsedRealtime` 复位反推。
      */
     private fun registerSysEvents() {
         if (sysReceiver != null) return
@@ -459,6 +466,27 @@ class MonitorService : Service() {
                                     Snap.event("wifi", Snap.wifiName(prev) + "->" + Snap.wifiName(cur))
                                 )
                             }
+                            // 关机/重启：这是**关机误报的第一现场** —— 系统此刻会关掉蓝牙适配器，
+                            // 而 bluetooth_on 设置值仍是 1，等适配器掉下来就会被记成「非人为关闭」。
+                            // 动态注册能收到（静态注册实测 0 条）；拿到它就能**当场**撤销、不用等下次开机反推。
+                            // 另注：ACTION_SHUTDOWN 是**有序广播**，onReceive 里要尽快返回，别做重活。
+                            Intent.ACTION_SHUTDOWN, Intent.ACTION_REBOOT -> {
+                                val reb = i.action == Intent.ACTION_REBOOT
+                                val n = Snap.revokeShutdownArtifact(
+                                    this@MonitorService,
+                                    System.currentTimeMillis(),
+                                    if (reb) "系统重启" else "系统关机"
+                                )
+                                LogStore.append(
+                                    this@MonitorService,
+                                    Snap.event(
+                                        "shutdown",
+                                        (if (reb) "reboot" else "shutdown") + " 系统正在关闭设备|bt=" +
+                                            Snap.btName(Snap.adapterState(this@MonitorService)) +
+                                            "|" + Snap.statsLine(this@MonitorService)
+                                    )
+                                )
+                            }
                         }
                     } catch (t: Throwable) {
                     }
@@ -472,6 +500,8 @@ class MonitorService : Service() {
                 addAction(Intent.ACTION_POWER_CONNECTED)
                 addAction(Intent.ACTION_POWER_DISCONNECTED)
                 addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
+                addAction(Intent.ACTION_SHUTDOWN)
+                addAction(Intent.ACTION_REBOOT)
             }
             // Android 13+ 动态注册要求显式声明是否对外导出；这些全是系统广播，用 NOT_EXPORTED。
             if (Build.VERSION.SDK_INT >= 33) {

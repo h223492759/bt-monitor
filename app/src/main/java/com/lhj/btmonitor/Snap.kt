@@ -13,6 +13,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.provider.Settings
+import java.util.Locale
 
 /**
  * 状态采集与文本行构造。所有字段都做成 key=value，方便外部脚本直接解析。
@@ -247,17 +248,8 @@ object Snap {
         }
 
         // —— 到这里 = elapsedRealtime 被复位，确实重启过 ——
-        // 撤销重启造成的误报：关机时系统关适配器、bluetooth_on 仍是 1，那次掉线被记成了「非人为关闭」。
-        // 要求它落在**本次采样窗口内**（上一拍之后），否则可能误撤销一次真实的蓝牙崩溃。
-        val lastCrash = p.getLong("last_crash_wall", 0L)
-        var revoked = 0
-        if (lastCrash >= wallPrev && wallNow - lastCrash < 10L * 60_000L) {
-            val c = p.getInt("crash_count", 0)
-            if (c > 0) {
-                p.edit().putInt("crash_count", c - 1).putLong("last_crash_wall", 0L).apply()
-                revoked = 1
-            }
-        }
+        // 撤销重启造成的误报（判据见 revokeShutdownArtifact 的注释）。
+        val revoked = revokeShutdownArtifact(ctx, wallPrev, "关机/重启")
         p.edit().putLong("stuck_since", 0L).putBoolean("stuck_reported", false).apply()
         out.add(
             event(
@@ -268,6 +260,137 @@ object Snap {
             )
         )
         return out
+    }
+
+    /**
+     * 撤销「关机造成的误报崩溃」。关机广播（ACTION_SHUTDOWN/ACTION_REBOOT）与重启自证**共用**此判据。
+     *
+     * 背景：关机/重启时系统会先关掉蓝牙适配器，而那一刻 `Settings.Global.bluetooth_on` **仍是 1**，
+     * 于是这次掉线被 onBluetoothChanged 记成一笔「非人为关闭」，凭空多 1 笔崩溃。
+     *
+     * 判据（三者必须同时成立）：
+     *  ① **之后再没恢复过**（`last_crash_recovered` = false）。真崩溃系统会自己把适配器重启回来
+     *     （实测形态 ON→TURNING_OFF→OFF→TURNING_ON→ON，全程 1~3 秒）；关机则永远回不来。
+     *  ② 它紧贴上一次采样：`lastCrash >= lastSampleWall - grace`，grace = 2 × 采样周期。
+     *     ❗窗口必须**两侧都放宽**。实测 2026-09-20 22:10 那次：crash 22:10:02.309 →
+     *     最后一拍 22:10:03.753 → 设备断电 —— **crash 落在最后一拍「之前」1.4 秒**。
+     *     旧版只判 `lastCrash >= 上一拍`（单侧、只看"之后"），于是漏撤、计数永久多 1。
+     *  ③ 与当前时刻相距 < 10 分钟（防墙钟被 NTP 调整造成的时间乱序）。
+     *
+     * ⚠️ 残留误差（刻意取舍）：若**真崩溃后适配器一直没起来**（卡死），且用户在 2 个采样周期内
+     *    就重启了设备，这笔真崩溃会被一起撤掉（少记 1）。两害相权取其轻 ——
+     *    宁可偶尔少记一笔"卡死不恢复"的极端情况，也不要**每次关机都平白多记一笔**。
+     *    撤销动作一律落 `EV|COUNT_ADJUSTED` 到日志，可回查、可审计、不静默。
+     *
+     * @param lastSampleWall 上一次采样（tick/net/watchdog/startup 任一来源）的墙钟毫秒
+     * @param why 写日志用的原因词（"关机/重启" / "系统关机" 等）
+     * @return 实际撤销的笔数（0 或 1）
+     */
+    fun revokeShutdownArtifact(ctx: Context, lastSampleWall: Long, why: String): Int {
+        val p = prefs(ctx)
+        val lastCrash = p.getLong("last_crash_wall", 0L)
+        if (lastCrash <= 0L) return 0
+        // 默认 true：老数据没有这个标记时**不撤销**（宁可漏撤，不可错撤）
+        if (p.getBoolean("last_crash_recovered", true)) return 0
+        val grace = p.getInt("interval", 60).coerceIn(10, 3600) * 1000L * 2
+        if (lastCrash < lastSampleWall - grace) return 0
+        val now = System.currentTimeMillis()
+        if (now - lastCrash > 10L * 60_000L || lastCrash - now > 10L * 60_000L) return 0
+        val c = p.getInt("crash_count", 0)
+        if (c <= 0) return 0
+        p.edit().putInt("crash_count", c - 1).putLong("last_crash_wall", 0L).apply()
+        LogStore.append(
+            ctx,
+            event(
+                "COUNT_ADJUSTED",
+                "撤销1笔由" + why + "造成的误报崩溃 崩溃=" + c + "->" + (c - 1) +
+                    "（该笔之后再无适配器恢复）"
+            )
+        )
+        return 1
+    }
+
+    /**
+     * 一次性历史回正：把**旧版漏撤**的那笔关机误报从计数里减掉。
+     *
+     * 为什么不能只靠 revokeShutdownArtifact：它是**当场**执行的；一旦当时没命中
+     * （例如 1.0.5 的单侧窗口漏判），事后 prefs 里只剩「最后一笔崩溃」这点残迹，
+     * 已经分不清它是关机误报还是真崩溃。所以这里**回到日志里找证据**：
+     *   ① 找到最后一处 `EV|REBOOT_DETECTED`，用它的「距上次采样=Ns」反算出上一次采样时刻；
+     *   ② 往前找最近一笔 `EV|SUSPECT_CRASH`，要求它与该时刻相差 ≤ 180 秒（= 就在断电前那一瞬）；
+     *   ③ 两者之间**没有任何恢复**（无 `bt_ready`、无 `->ON` / `->TURNING_ON`）；
+     *   ④ 它记录的 `崩溃=N` 恰好等于**当前** crash_count（说明此后没再产生新崩溃）。
+     * 四条同时成立才判定为关机误报，减 1 并落一行 `EV|COUNT_ADJUSTED` 供审计。
+     *
+     * 只跑一次（`count_fixed_v7`）；找不到证据就**什么都不做** —— 不回正、不猜测。
+     */
+    fun repairShutdownArtifactFromLog(ctx: Context) {
+        val p = prefs(ctx)
+        if (p.getBoolean("count_fixed_v7", false)) return
+        p.edit().putBoolean("count_fixed_v7", true).apply()
+        val cur = p.getInt("crash_count", 0)
+        if (cur <= 0) return
+        try {
+            val files = LogStore.listDayFiles(ctx).takeLast(3)
+            if (files.isEmpty()) return
+            val rows = ArrayList<Pair<Long, String>>()
+            val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+            for (f in files) {
+                val day = f.name.removePrefix("btmon-").removeSuffix(".txt")
+                val text = try {
+                    f.readText(Charsets.UTF_8)
+                } catch (t: Throwable) {
+                    continue
+                }
+                for (ln in text.split('\n')) {
+                    if (ln.length < 13 || ln[2] != ':' || ln[5] != ':') continue
+                    val ms = try {
+                        fmt.parse(day + " " + ln.substring(0, 12))?.time
+                    } catch (t: Throwable) {
+                        null
+                    }
+                    if (ms == null) continue
+                    rows.add(Pair(ms, ln.substring(13)))
+                }
+            }
+            if (rows.size < 3) return
+            rows.sortBy { it.first }
+            val rb = rows.indexOfLast { it.second.startsWith("EV|REBOOT_DETECTED|") }
+            if (rb <= 0) return
+            val gapM = Regex("距上次采样=(\\d+)s").find(rows[rb].second) ?: return
+            val lastSample = rows[rb].first - gapM.groupValues[1].toLong() * 1000L
+            var ci = -1
+            for (k in rb - 1 downTo 0) {
+                if (rows[k].second.startsWith("EV|SUSPECT_CRASH|")) {
+                    ci = k
+                    break
+                }
+            }
+            if (ci < 0) return
+            val crashMs = rows[ci].first
+            val cntM = Regex("崩溃=(\\d+)").find(rows[ci].second) ?: return
+            if (cntM.groupValues[1].toInt() != cur) return
+            if (Math.abs(lastSample - crashMs) > 180_000L) return
+            for (k in ci + 1 until rb) {
+                val b = rows[k].second
+                if (b.startsWith("EV|bt_ready|")) return
+                if (b.startsWith("EV|bt_adapter|") &&
+                    (b.contains("->ON/") || b.contains("->TURNING_ON/"))
+                ) return
+            }
+            val c = cur - 1
+            p.edit().putInt("crash_count", c).putLong("last_crash_wall", 0L).apply()
+            LogStore.append(
+                ctx,
+                event(
+                    "COUNT_ADJUSTED",
+                    "历史回正：撤销1笔关机误报崩溃 崩溃=" + cur + "->" + c +
+                        "（该笔之后无任何适配器恢复且紧接关机）"
+                )
+            )
+        } catch (t: Throwable) {
+            // 回正失败绝不影响监控主流程
+        }
     }
 
     /** 一行汇总，方便导出时只看这一条就够 */
@@ -363,6 +486,9 @@ object Snap {
                 .putInt("reached_on_count", p.getInt("reached_on_count", 0) + 1)
                 .putLong("stuck_since", 0L)
                 .putBoolean("stuck_reported", false)
+                // 到达 ON = 上一笔崩溃**已经恢复**。这是区分「真崩溃」与「关机误报」的关键：
+                // 真崩溃系统会自己把适配器重启回来（实测 1~2 秒），关机误报则永远回不来。
+                .putBoolean("last_crash_recovered", true)
                 .apply()
             lines.add(event("bt_ready", "reached_ON|btName=" + clean(adapterName(ctx)) + "|" + statsLine(ctx)))
             // 关键：脱离「想开没开」的结算必须在这里做。状态恢复总能被广播先捕获，
@@ -419,6 +545,8 @@ object Snap {
                 .putLong("last_crash_wall", now)
                 .putString("last_crash_mode", mode)
                 .putInt("crash_burst", burst)
+                // 刚记下的这笔还「没恢复」；若之后收到 bt_ready/ON 会被翻成 true
+                .putBoolean("last_crash_recovered", false)
                 .apply()
 
             if (burst == 1) {
