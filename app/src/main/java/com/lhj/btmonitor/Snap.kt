@@ -263,6 +263,29 @@ object Snap {
     }
 
     /**
+     * 关机/重启广播与随之而来的「掉线」之间允许的最大间隔。
+     * 实测 2026-09-20 22:41 那次只差 **4ms**（广播 31.183，掉线 31.187），10 秒绰绰有余。
+     */
+    private const val SHUTDOWN_GRACE_MS = 10_000L
+
+    /**
+     * 标一个「刚刚收到关机/重启广播」的时间窗。
+     *
+     * 为什么必须有它：**系统关蓝牙** 和 **发 shutdown 广播** 是两条**互相独立**的通道，
+     * 谁先谁后是随机的 —— 实测 2026-09-20 22:41:31.183 广播先到，31.187 掉线后到（差 4ms）。
+     * 只在「广播到达时撤销**已有的**那笔」是**单向**的：广播先到时它必然扑空（那一刻还没有崩溃可撤），
+     * 于是那笔误报要一直等到**下次开机**靠单调钟自证才被反推回来 —— 计数在
+     * 「关机 → 下次开机」这段窗口里一直是错的（实测 1.0.6 就是这样，差 3 分 20 秒）。
+     *
+     * 修法：广播一到就落这个标记，**崩溃记完立刻回查**（见 onBluetoothChanged）。谁先到都能覆盖。
+     * 同一类错误在本项目出现过两次（上一次是「撤销窗口只判单侧」），教训一致：
+     * **两个独立通道之间的时序假设，必须双向缝合，不能只写一个方向。**
+     */
+    fun markShutdownWindow(ctx: Context) {
+        prefs(ctx).edit().putLong("shutdown_marker", System.currentTimeMillis()).apply()
+    }
+
+    /**
      * 撤销「关机造成的误报崩溃」。关机广播（ACTION_SHUTDOWN/ACTION_REBOOT）与重启自证**共用**此判据。
      *
      * 背景：关机/重启时系统会先关掉蓝牙适配器，而那一刻 `Settings.Global.bluetooth_on` **仍是 1**，
@@ -284,9 +307,17 @@ object Snap {
      *
      * @param lastSampleWall 上一次采样（tick/net/watchdog/startup 任一来源）的墙钟毫秒
      * @param why 写日志用的原因词（"关机/重启" / "系统关机" 等）
+     * @param out 非空时，把 `COUNT_ADJUSTED` 行**交回调用方**而不是直接落盘。
+     *            用于「崩溃刚记下、立刻回查撤销」的场合：撤销行必须排在 `SUSPECT_CRASH` **之后**，
+     *            直接写会和还没落盘的崩溃行**顺序颠倒**，导出后读起来像"先撤了再记"。
      * @return 实际撤销的笔数（0 或 1）
      */
-    fun revokeShutdownArtifact(ctx: Context, lastSampleWall: Long, why: String): Int {
+    fun revokeShutdownArtifact(
+        ctx: Context,
+        lastSampleWall: Long,
+        why: String,
+        out: MutableList<String>? = null
+    ): Int {
         val p = prefs(ctx)
         val lastCrash = p.getLong("last_crash_wall", 0L)
         if (lastCrash <= 0L) return 0
@@ -298,15 +329,16 @@ object Snap {
         if (now - lastCrash > 10L * 60_000L || lastCrash - now > 10L * 60_000L) return 0
         val c = p.getInt("crash_count", 0)
         if (c <= 0) return 0
-        p.edit().putInt("crash_count", c - 1).putLong("last_crash_wall", 0L).apply()
-        LogStore.append(
-            ctx,
-            event(
-                "COUNT_ADJUSTED",
-                "撤销1笔由" + why + "造成的误报崩溃 崩溃=" + c + "->" + (c - 1) +
-                    "（该笔之后再无适配器恢复）"
-            )
+        p.edit().putInt("crash_count", c - 1).putLong("last_crash_wall", 0L)
+            // 这次关机的使命已完成，标记一并清掉（避免 10 秒窗口内误撤后续的真崩溃）
+            .putLong("shutdown_marker", 0L)
+            .apply()
+        val line = event(
+            "COUNT_ADJUSTED",
+            "撤销1笔由" + why + "造成的误报崩溃 崩溃=" + c + "->" + (c - 1) +
+                "（该笔之后再无适配器恢复）"
         )
+        if (out != null) out.add(line) else LogStore.append(ctx, line)
         return 1
     }
 
@@ -548,6 +580,20 @@ object Snap {
                 // 刚记下的这笔还「没恢复」；若之后收到 bt_ready/ON 会被翻成 true
                 .putBoolean("last_crash_recovered", false)
                 .apply()
+
+            // 3b) **双向缝合的下半程**：刚才是否刚收到关机/重启广播？
+            //     广播和掉线是两条独立通道、先后随机（实测差 4ms 且广播在前）。若广播先到，
+            //     上面那次 revokeShutdownArtifact 会扑空，得靠这里补 —— 崩溃一记下就回查标记，
+            //     命中就当场撤销。撤销行交给 lines 一起返回，保证它排在 SUSPECT_CRASH **之后**。
+            val mark = p.getLong("shutdown_marker", 0L)
+            if (mark > 0L) {
+                if (now - mark <= SHUTDOWN_GRACE_MS) {
+                    // 原因写"关机/重启"：标记不区分二者（ACTION_REBOOT 也走这条路）
+                    revokeShutdownArtifact(ctx, now, "关机/重启", lines)
+                } else {
+                    p.edit().putLong("shutdown_marker", 0L).apply()   // 过期，清掉
+                }
+            }
 
             if (burst == 1) {
                 lines.add(

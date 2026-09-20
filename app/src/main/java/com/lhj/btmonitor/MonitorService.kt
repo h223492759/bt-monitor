@@ -472,18 +472,23 @@ class MonitorService : Service() {
                             // 另注：ACTION_SHUTDOWN 是**有序广播**，onReceive 里要尽快返回，别做重活。
                             Intent.ACTION_SHUTDOWN, Intent.ACTION_REBOOT -> {
                                 val reb = i.action == Intent.ACTION_REBOOT
+                                val why = if (reb) "系统重启" else "系统关机"
+                                // 先撤「已经记下的那笔」（= 掉线比广播早的情况）
                                 val n = Snap.revokeShutdownArtifact(
-                                    this@MonitorService,
-                                    System.currentTimeMillis(),
-                                    if (reb) "系统重启" else "系统关机"
+                                    this@MonitorService, System.currentTimeMillis(), why
                                 )
+                                // 再落时间窗（= 广播比掉线早的情况）。顺序不能省：
+                                // 「关蓝牙」与「发广播」是两条独立通道，谁先到是随机的，
+                                // 只做一头就会漏掉另一头 —— 实测 1.0.6 漏的正是「广播先到」这一半。
+                                Snap.markShutdownWindow(this@MonitorService)
                                 LogStore.append(
                                     this@MonitorService,
                                     Snap.event(
                                         "shutdown",
                                         (if (reb) "reboot" else "shutdown") + " 系统正在关闭设备|bt=" +
                                             Snap.btName(Snap.adapterState(this@MonitorService)) +
-                                            "|" + Snap.statsLine(this@MonitorService)
+                                            "|" + Snap.statsLine(this@MonitorService) +
+                                            "|已当场撤销=" + n
                                     )
                                 )
                             }
